@@ -1,0 +1,15 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock          # binary: usually commit. Ignoring during early scaffolding.
+
+# Secrets / local config
+.env
+.env.*
+config.local.*
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
