@@ -1,0 +1,11 @@
+[package]
+name = "trust-crypto-server"
+description = "Server-side MLS handling: the per-group commit sequencer. Treats all MLS bodies as opaque."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+uuid.workspace = true
+thiserror.workspace = true

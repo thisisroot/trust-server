@@ -1,0 +1,9 @@
+[package]
+name = "trust-signaling"
+description = "Placeholder for WebRTC/SFU call signaling (roadmap step 8). Keeps the workspace shape stable."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]

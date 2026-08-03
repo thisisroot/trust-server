@@ -1,0 +1,12 @@
+# Example trust-server configuration.
+# Copy to `trust-server.toml` and edit, or set the equivalent TRUST_* env vars.
+# Precedence: built-in defaults < this file < TRUST_* environment variables.
+
+# Address the HTTP/WebSocket listener binds to.
+bind_addr = "0.0.0.0:8080"
+
+# Postgres connection string.
+database_url = "postgres://trust:trust@localhost:5432/trust"
+
+# Maximum pooled database connections.
+max_connections = 5

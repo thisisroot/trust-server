@@ -1,0 +1,72 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/protocol",
+    "crates/storage",
+    "crates/realtime",
+    "crates/crypto",
+    "crates/signaling",
+    "crates/server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+rust-version = "1.85"
+
+# One place for shared dependency versions so the whole workspace stays aligned.
+[workspace.dependencies]
+# Async runtime + web
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors", "timeout"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Storage
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "uuid",
+    "time",
+    "macros",
+    "migrate",
+] }
+
+# Primitives
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+time = { version = "0.3", features = ["serde", "serde-well-known", "formatting", "parsing"] }
+
+# Config, errors, logging
+figment = { version = "0.10", features = ["toml", "env"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Concurrency helpers
+dashmap = "6"
+
+# Auth / crypto for tokens & passwords
+argon2 = "0.5"
+sha2 = "0.10"
+rand = "0.8"
+base64 = "0.22"
+
+# Trait objects with async methods (the storage abstraction).
+async-trait = "0.1"
+
+# Internal crates
+trust-protocol-types = { path = "crates/protocol" }
+trust-storage = { path = "crates/storage" }
+trust-realtime = { path = "crates/realtime" }
+trust-crypto-server = { path = "crates/crypto" }
+trust-signaling = { path = "crates/signaling" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

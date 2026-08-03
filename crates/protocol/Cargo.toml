@@ -1,0 +1,14 @@
+[package]
+name = "trust-protocol-types"
+description = "Hand-written Rust wire types for the Trust protocol, guarded by the shared golden payloads."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+time.workspace = true
+thiserror.workspace = true
