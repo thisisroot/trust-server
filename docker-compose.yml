@@ -1,0 +1,36 @@
+# Local backend on Docker: Postgres + the Trust server.
+#   docker compose up -d --build
+#   curl localhost:8080/health   # {"db":"up",...}
+# The server reaches Postgres over the compose network (postgres:5432); the DB
+# port isn't exposed to the host, so it won't clash with any local Postgres.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: trust
+      POSTGRES_PASSWORD: trust
+      POSTGRES_DB: trust
+    volumes:
+      - trust_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trust -d trust"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  server:
+    build: .
+    environment:
+      TRUST_BIND_ADDR: 0.0.0.0:8080
+      TRUST_DATABASE_URL: postgres://trust:trust@postgres:5432/trust
+      RUST_LOG: info
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  trust_pgdata:

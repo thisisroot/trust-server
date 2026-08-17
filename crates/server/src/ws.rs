@@ -83,9 +83,17 @@ struct Inbound {
     message_id: Option<String>,
     emoji: Option<String>,
     up_to_seq: Option<i64>,
+    activity: Option<String>,
+    // Call signaling (opaque to the server — routed, never inspected).
+    from: Option<String>,
+    call_id: Option<String>,
+    media: Option<String>,
+    sdp: Option<serde_json::Value>,
+    candidate: Option<serde_json::Value>,
 }
 
-/// Relay typing, delivery/read receipts, and reactions to the target peer.
+/// Relay typing, delivery/read receipts, reactions, and call signaling to the
+/// target peer.
 async fn handle_inbound(state: &AppState, account: Uuid, text: &str) {
     let Ok(msg) = serde_json::from_str::<Inbound>(text) else {
         return;
@@ -113,7 +121,10 @@ async fn handle_inbound(state: &AppState, account: Uuid, text: &str) {
     }
 
     let payload = match msg.type_.as_str() {
-        "typing.start" | "typing.stop" | "receipt.delivered" => {
+        "typing.start" | "typing.stop" => {
+            json!({ "conversationId": convo, "byUserId": account, "activity": msg.activity })
+        }
+        "receipt.delivered" => {
             json!({ "conversationId": convo, "byUserId": account })
         }
         "receipt.read" => {
@@ -124,6 +135,18 @@ async fn handle_inbound(state: &AppState, account: Uuid, text: &str) {
             "byUserId": account,
             "messageId": msg.message_id,
             "emoji": msg.emoji,
+        }),
+        // 1:1 call signaling: relay the opaque SDP/ICE blob to the peer, stamping
+        // the authenticated caller id so the callee can trust who's calling.
+        "call.invite" | "call.answer" | "call.ice" | "call.decline" | "call.hangup"
+        | "call.busy" => json!({
+            "conversationId": convo,
+            "fromUserId": account,
+            "from": msg.from,
+            "callId": msg.call_id,
+            "media": msg.media,
+            "sdp": msg.sdp,
+            "candidate": msg.candidate,
         }),
         _ => return,
     };

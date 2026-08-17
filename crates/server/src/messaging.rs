@@ -99,8 +99,10 @@ pub async fn list_users(
 pub struct SendReq {
     to_username: String,
     ciphertext: String,
-    /// Optional media descriptor; when present, indexed for the shared-media view.
+    /// A single media descriptor (legacy) …
     attachment: Option<crate::media::AttachmentMeta>,
+    /// … or an album of them; each is indexed for the shared-media view.
+    attachments: Option<Vec<crate::media::AttachmentMeta>>,
 }
 
 /// POST /v0/messages — send a message to a user; delivers over the bus.
@@ -123,9 +125,13 @@ pub async fn send_message(
     let convo = db::dm_conversation(&state.db.pool, me, target.id).await?;
     let msg = db::store_message(&state.db.pool, convo, me, my_device, &bytes).await?;
 
-    // Index any attachment for the conversation's shared-media view.
-    if let Some(att) = req.attachment {
-        let parse = |s: &Option<String>| s.as_deref().and_then(|v| Uuid::parse_str(v).ok());
+    // Index any attachments (single or album) for the shared-media view.
+    let mut atts = req.attachments.unwrap_or_default();
+    if atts.is_empty() {
+        atts.extend(req.attachment);
+    }
+    let parse = |s: &Option<String>| s.as_deref().and_then(|v| Uuid::parse_str(v).ok());
+    for att in atts {
         db::record_media(
             &state.db.pool,
             convo,
