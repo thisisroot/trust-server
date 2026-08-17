@@ -1,6 +1,6 @@
 //! WebSocket endpoint: authenticated per device via a `?token=` query param
 //! (WS handshakes can't carry an Authorization header). Forwards bus events to
-//! the socket, relays inbound typing, and maintains presence on connect/disconnect.
+//! the socket, relays inbound typing/receipts/reactions, and maintains presence.
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
@@ -8,10 +8,12 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::json;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::app::AppState;
 use crate::auth::authed_from_token;
+use crate::db;
 use crate::messaging::{broadcast_presence, deliver_to_account, envelope};
 
 #[derive(Deserialize)]
@@ -33,7 +35,7 @@ pub async fn ws_handler(
 }
 
 async fn handle_socket(state: AppState, mut socket: WebSocket, account: Uuid, device: Uuid) {
-    if state.hub.on_connect(device, account) {
+    if state.presence.on_connect(device, account) {
         broadcast_presence(&state, account, true, None).await;
     }
     let mut rx = state.bus.subscribe(device);
@@ -49,8 +51,7 @@ async fn handle_socket(state: AppState, mut socket: WebSocket, account: Uuid, de
                             }
                         }
                     }
-                    // Lagged (slow consumer): drop and keep going.
-                    Err(_) => continue,
+                    Err(_) => continue, // lagged; keep going
                 }
             }
             incoming = socket.recv() => {
@@ -64,9 +65,11 @@ async fn handle_socket(state: AppState, mut socket: WebSocket, account: Uuid, de
         }
     }
 
-    if let Some((acc, went_offline, at)) = state.hub.on_disconnect(device) {
+    if let Some((acc, went_offline)) = state.presence.on_disconnect(device) {
         if went_offline {
-            broadcast_presence(&state, acc, false, Some(at)).await;
+            let now = OffsetDateTime::now_utc();
+            let _ = db::set_last_seen(&state.db.pool, acc, now).await;
+            broadcast_presence(&state, acc, false, Some(now)).await;
         }
     }
 }
@@ -93,14 +96,18 @@ async fn handle_inbound(state: &AppState, account: Uuid, text: &str) {
     let Ok(Some(target)) = state.auth.find_account_by_username(to).await else {
         return;
     };
-    let convo = state.hub.conversation_id(account, target.id);
+    let Ok(convo) = db::dm_conversation(&state.db.pool, account, target.id).await else {
+        return;
+    };
 
     // Persist delivery/read progress so status survives history reloads.
     match msg.type_.as_str() {
-        "receipt.delivered" => state.hub.mark_delivered(convo, account),
+        "receipt.delivered" => {
+            let _ = db::mark_delivered(&state.db.pool, convo, account).await;
+        }
         "receipt.read" => {
-            state.hub.mark_delivered(convo, account);
-            state.hub.mark_read(convo, account);
+            let _ = db::mark_delivered(&state.db.pool, convo, account).await;
+            let _ = db::mark_read(&state.db.pool, convo, account).await;
         }
         _ => {}
     }

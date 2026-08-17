@@ -1,9 +1,6 @@
-//! In-memory binary blob store for avatars and image messages (dev). A blob is
-//! opaque bytes + a content type; uploads are authenticated, downloads are open
-//! so the client can load them directly via a URL.
-
-use std::collections::HashMap;
-use std::sync::Mutex;
+//! Binary blob storage (avatars, image/file messages), Postgres-backed. A blob
+//! is opaque bytes + a content type; uploads are authenticated, downloads are
+//! open so the client can load them directly via a URL.
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -15,48 +12,8 @@ use uuid::Uuid;
 
 use crate::app::AppState;
 use crate::auth::authed;
+use crate::db;
 use crate::error::AppError;
-
-#[derive(Clone)]
-pub struct Blob {
-    pub content_type: String,
-    pub bytes: Vec<u8>,
-}
-
-#[derive(Default)]
-pub struct BlobStore {
-    map: Mutex<HashMap<Uuid, Blob>>,
-}
-
-impl BlobStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn put(&self, content_type: String, bytes: Vec<u8>) -> Uuid {
-        let id = Uuid::new_v4();
-        self.map.lock().unwrap().insert(id, Blob { content_type, bytes });
-        id
-    }
-
-    pub fn get(&self, id: Uuid) -> Option<Blob> {
-        self.map.lock().unwrap().get(&id).cloned()
-    }
-
-    /// Insert a blob under a known id (used when restoring persisted blobs).
-    pub fn insert(&self, id: Uuid, content_type: String, bytes: Vec<u8>) {
-        self.map.lock().unwrap().insert(id, Blob { content_type, bytes });
-    }
-
-    /// (id, content_type) for every stored blob — bytes are persisted separately.
-    pub fn manifest(&self) -> Vec<(Uuid, String)> {
-        self.map.lock().unwrap().iter().map(|(k, v)| (*k, v.content_type.clone())).collect()
-    }
-
-    pub fn bytes_of(&self, id: Uuid) -> Option<Vec<u8>> {
-        self.map.lock().unwrap().get(&id).map(|b| b.bytes.clone())
-    }
-}
 
 /// POST /v0/blobs — upload raw bytes; returns the blob id.
 pub async fn upload_blob(
@@ -73,14 +30,14 @@ pub async fn upload_blob(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_string();
-    let id = state.blobs.put(content_type, body.to_vec());
+    let id = db::put_blob(&state.db.pool, &content_type, &body).await?;
     Ok(Json(json!({ "blobId": id })))
 }
 
 /// GET /v0/blobs/{id} — download bytes (open, so `Image.network` can load it).
 pub async fn get_blob(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
-    match state.blobs.get(id) {
-        Some(blob) => (
+    match db::get_blob(&state.db.pool, id).await {
+        Ok(Some(blob)) => (
             [
                 (header::CONTENT_TYPE, blob.content_type),
                 (header::CACHE_CONTROL, "public, max-age=31536000".to_string()),
@@ -88,6 +45,7 @@ pub async fn get_blob(State(state): State<AppState>, Path(id): Path<Uuid>) -> Re
             blob.bytes,
         )
             .into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

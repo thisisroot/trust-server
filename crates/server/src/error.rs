@@ -54,3 +54,14 @@ impl From<StorageError> for AppError {
         AppError::Internal(err.to_string())
     }
 }
+
+impl From<sqlx::Error> for AppError {
+    fn from(err: sqlx::Error) -> Self {
+        if let sqlx::Error::Database(ref db) = err {
+            if db.is_unique_violation() {
+                return AppError::Conflict("already exists".to_string());
+            }
+        }
+        AppError::Internal(err.to_string())
+    }
+}

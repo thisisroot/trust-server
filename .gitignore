@@ -14,3 +14,6 @@ trust-server.toml   # local config; commit trust-server.example.toml instead
 .vscode/
 *.swp
 .DS_Store
+
+# Local dev data (JSON snapshot store; superseded by Postgres)
+trust-data/

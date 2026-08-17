@@ -43,15 +43,16 @@ CREATE TABLE key_packages (
     consumed_at  TIMESTAMPTZ,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
--- Fast "claim one unconsumed package for this device" lookups.
 CREATE INDEX key_packages_claim_idx
     ON key_packages(device_id) WHERE consumed_at IS NULL AND last_resort = FALSE;
 
--- Conversations. `kind` generalizes 1:1 ('dm') to groups later.
+-- Conversations. `kind` generalizes 1:1 ('dm') to groups later. `last_seq` is the
+-- per-conversation monotonic counter, bumped atomically to assign message seqs.
 CREATE TABLE conversations (
     id         UUID PRIMARY KEY,
     kind       TEXT NOT NULL DEFAULT 'dm',
-    epoch      BIGINT NOT NULL DEFAULT 0,      -- MLS epoch; server sequences commits via CAS
+    epoch      BIGINT NOT NULL DEFAULT 0,      -- MLS epoch; server sequences commits via CAS (later)
+    last_seq   BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -60,38 +61,79 @@ CREATE TABLE conversation_members (
     account_id      UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     PRIMARY KEY (conversation_id, account_id)
 );
+CREATE INDEX conversation_members_account_idx ON conversation_members(account_id);
 
--- Messages. Ciphertext only. `seq` is gap-free per conversation; idempotent on client_msg_id.
+-- Stable 1:1 mapping from an unordered account pair to its conversation. For a
+-- self-chat (Saved Messages) account_lo = account_hi.
+CREATE TABLE dm_conversations (
+    account_lo      UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    account_hi      UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    PRIMARY KEY (account_lo, account_hi)
+);
+
+-- Messages. Ciphertext only; `seq` is gap-free per conversation.
 CREATE TABLE messages (
-    id               UUID PRIMARY KEY,
-    conversation_id  UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    seq              BIGINT NOT NULL,
-    sender_device_id UUID NOT NULL REFERENCES devices(id),
-    client_msg_id    UUID NOT NULL,
-    ciphertext       BYTEA NOT NULL,
-    server_ts        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (conversation_id, seq),
-    UNIQUE (conversation_id, client_msg_id)
+    id                UUID PRIMARY KEY,
+    conversation_id   UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    seq               BIGINT NOT NULL,
+    sender_account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    sender_device_id  UUID,                    -- null for system/seed; not FK-constrained
+    ciphertext        BYTEA NOT NULL,
+    server_ts         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (conversation_id, seq)
 );
 CREATE INDEX messages_conversation_seq_idx ON messages(conversation_id, seq);
 
--- Per-recipient-device delivery queue: the store-and-forward backbone for offline + multi-device.
-CREATE TYPE delivery_state AS ENUM ('queued', 'delivered', 'read');
-CREATE TABLE delivery_queue (
-    id                  UUID PRIMARY KEY,
-    message_id          UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-    recipient_device_id UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
-    state               delivery_state NOT NULL DEFAULT 'queued',
-    delivered_at        TIMESTAMPTZ,
-    UNIQUE (message_id, recipient_device_id)
-);
-CREATE INDEX delivery_queue_device_idx
-    ON delivery_queue(recipient_device_id) WHERE state = 'queued';
-
--- High-water-mark read receipts (not per-message, so groups stay cheap).
+-- High-water-mark receipts, per account (so groups stay cheap).
 CREATE TABLE read_markers (
     conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    device_id       UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    account_id      UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     up_to_seq       BIGINT NOT NULL,
-    PRIMARY KEY (conversation_id, device_id)
+    PRIMARY KEY (conversation_id, account_id)
 );
+CREATE TABLE delivered_markers (
+    conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    account_id      UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    up_to_seq       BIGINT NOT NULL,
+    PRIMARY KEY (conversation_id, account_id)
+);
+
+-- User profiles.
+CREATE TABLE profiles (
+    account_id     UUID PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    display_name   TEXT,
+    bio            TEXT,
+    avatar_blob_id UUID,
+    last_seen      TIMESTAMPTZ
+);
+
+-- Binary blobs (avatars, image/file messages). Opaque bytes + content type.
+-- (Object storage is the scale target; Postgres BYTEA is fine at this stage.)
+CREATE TABLE blobs (
+    id           UUID PRIMARY KEY,
+    content_type TEXT NOT NULL,
+    bytes        BYTEA NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Shared-media index per conversation (photos/videos/music/files/links/voice).
+CREATE TABLE media (
+    id                UUID PRIMARY KEY,
+    conversation_id   UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    message_id        UUID NOT NULL,
+    sender_account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    seq               BIGINT NOT NULL,
+    kind              TEXT NOT NULL,           -- photo | video | music | file | link | voice
+    blob_id           UUID,
+    thumb_blob_id     UUID,
+    mime              TEXT,
+    name              TEXT,
+    url               TEXT,
+    size              BIGINT,
+    width             BIGINT,
+    height            BIGINT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Covering index for the paginated shared-media reads: newest-first by kind.
+CREATE INDEX media_convo_kind_seq_idx ON media(conversation_id, kind, seq DESC);

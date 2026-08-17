@@ -19,21 +19,18 @@ use trust_storage::auth_store::AuthStore;
 use trust_storage::Db;
 
 /// Everything handlers need, cheaply cloneable (all fields are handles).
+///
+/// Durable state lives in Postgres (`db`); the only in-memory piece is live
+/// presence/connection tracking, which is runtime state, not data.
 #[derive(Clone)]
 pub struct AppState {
     pub db: Db,
-    /// Accounts / devices / sessions store (Postgres or in-memory).
+    /// Accounts / devices / sessions store.
     pub auth: Arc<dyn AuthStore>,
     /// Real-time delivery fan-out to connected devices.
     pub bus: Arc<dyn RealtimeBus>,
-    /// In-memory messaging + presence state (dev).
-    pub hub: Arc<crate::hub::Hub>,
-    /// Binary blobs (avatars, image messages).
-    pub blobs: Arc<crate::blobs::BlobStore>,
-    /// User profiles (display name, bio, avatar).
-    pub profiles: Arc<crate::profile::Profiles>,
-    /// Shared-media index per conversation (photos/files/links/…).
-    pub media: Arc<crate::media::MediaIndex>,
+    /// Live presence / connected devices (in memory; last_seen persists to DB).
+    pub presence: Arc<crate::presence::Presence>,
     /// Capabilities this server advertises in the handshake.
     pub capabilities: Arc<Vec<Capability>>,
 }
@@ -44,11 +41,7 @@ impl AppState {
             db,
             auth,
             bus: Arc::new(InProcessBus::default()),
-            hub: Arc::new(crate::hub::Hub::new()),
-            blobs: Arc::new(crate::blobs::BlobStore::new()),
-            profiles: Arc::new(crate::profile::Profiles::new()),
-            media: Arc::new(crate::media::MediaIndex::new()),
-            // v0 thin slice: messaging + receipts + typing. `mls` follows.
+            presence: Arc::new(crate::presence::Presence::new()),
             capabilities: Arc::new(vec![
                 Capability::Messaging,
                 Capability::Receipts,

@@ -1,6 +1,6 @@
-//! User directory + 1:1 messaging (send / history) and the delivery helpers.
+//! User directory + 1:1 messaging (send / history) and delivery helpers.
 //! Message bodies are opaque base64 (dev sends base64 plaintext; MLS ciphertext
-//! later). Delivery fans out over the realtime bus to connected devices.
+//! later). Durable state is in Postgres; delivery fans out over the realtime bus.
 
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::app::AppState;
 use crate::auth::authed;
+use crate::db;
 use crate::error::AppError;
 
 fn rfc3339(dt: OffsetDateTime) -> String {
@@ -65,7 +66,7 @@ pub async fn broadcast_presence(
             "lastSeen": last_seen.map(rfc3339),
         }),
     );
-    for device in state.hub.connected_devices() {
+    for device in state.presence.connected_devices() {
         state.bus.publish(device, env.clone());
     }
 }
@@ -76,20 +77,21 @@ pub async fn list_users(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     let (me, _device) = authed(&state, &headers).await?;
-    let accounts = state.auth.list_accounts().await?;
-    let users: Vec<Value> = accounts
+    let users = db::list_users(&state.db.pool, me).await?;
+    let out: Vec<Value> = users
         .into_iter()
-        .filter(|a| a.id != me)
-        .map(|a| {
+        .map(|u| {
             json!({
-                "userId": a.id,
-                "username": a.username,
-                "online": state.hub.is_online(a.id),
-                "lastSeen": state.hub.last_seen(a.id).map(rfc3339),
+                "userId": u.id,
+                "username": u.username,
+                "displayName": u.display_name,
+                "avatarBlobId": u.avatar_blob_id,
+                "online": state.presence.is_online(u.id),
+                "lastSeen": u.last_seen.map(rfc3339),
             })
         })
         .collect();
-    Ok(Json(json!(users)))
+    Ok(Json(json!(out)))
 }
 
 #[derive(Deserialize)]
@@ -118,33 +120,29 @@ pub async fn send_message(
         .decode(req.ciphertext.as_bytes())
         .map_err(|_| AppError::BadRequest("ciphertext must be base64".into()))?;
 
-    let convo = state.hub.conversation_id(me, target.id);
-    // First message in a fresh (non-self) conversation seeds backdated history (dev).
-    if target.id != me && !state.hub.has_messages(convo) {
-        state.hub.seed_backdated(convo, me, target.id);
-    }
-    let msg = state.hub.store_message(convo, me, my_device, bytes.clone());
+    let convo = db::dm_conversation(&state.db.pool, me, target.id).await?;
+    let msg = db::store_message(&state.db.pool, convo, me, my_device, &bytes).await?;
 
     // Index any attachment for the conversation's shared-media view.
     if let Some(att) = req.attachment {
         let parse = |s: &Option<String>| s.as_deref().and_then(|v| Uuid::parse_str(v).ok());
-        state.media.record(crate::media::MediaEntry {
-            id: Uuid::new_v4(),
-            conversation_id: convo,
-            message_id: msg.id,
-            sender_account: me,
-            seq: msg.seq,
-            kind: att.kind,
-            blob_id: parse(&att.blob_id),
-            thumb_blob_id: parse(&att.thumb_blob_id),
-            mime: att.mime,
-            name: att.name,
-            url: att.url,
-            size: att.size,
-            width: att.width,
-            height: att.height,
-            ts: msg.ts,
-        });
+        db::record_media(
+            &state.db.pool,
+            convo,
+            msg.id,
+            me,
+            msg.seq,
+            &att.kind,
+            parse(&att.blob_id),
+            parse(&att.thumb_blob_id),
+            att.mime,
+            att.name,
+            att.url,
+            att.size,
+            att.width,
+            att.height,
+        )
+        .await?;
     }
 
     let env = envelope(
@@ -156,7 +154,7 @@ pub async fn send_message(
             "senderAccountId": me,
             "senderDeviceId": my_device,
             "ciphertext": STANDARD.encode(&bytes),
-            "serverTs": rfc3339(msg.ts),
+            "serverTs": rfc3339(msg.server_ts),
         }),
     );
     if target.id == me {
@@ -170,7 +168,7 @@ pub async fn send_message(
     Ok(Json(json!({
         "messageId": msg.id,
         "seq": msg.seq,
-        "serverTs": rfc3339(msg.ts),
+        "serverTs": rfc3339(msg.server_ts),
         "conversationId": convo,
     })))
 }
@@ -182,31 +180,22 @@ pub async fn list_conversations(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     let (me, _device) = authed(&state, &headers).await?;
-    let accounts = state.auth.list_accounts().await?;
-    let mut items: Vec<(Value, i64)> = Vec::new();
-    for (other, cid) in state.hub.conversations_for(me) {
-        let username = accounts
-            .iter()
-            .find(|a| a.id == other)
-            .map(|a| a.username.clone())
-            .unwrap_or_default();
-        let last = state.hub.last_message_ts(cid);
-        let prof = state.profiles.get(other);
-        items.push((
+    let rows = db::conversations_for(&state.db.pool, me).await?;
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
             json!({
-                "userId": other,
-                "username": username,
-                "displayName": prof.display_name,
-                "avatarBlobId": prof.avatar_blob_id,
-                "online": state.hub.is_online(other),
-                "lastSeen": state.hub.last_seen(other).map(rfc3339),
-                "conversationId": cid,
-            }),
-            last.map(|t| t.unix_timestamp()).unwrap_or(0),
-        ));
-    }
-    items.sort_by(|a, b| b.1.cmp(&a.1));
-    Ok(Json(json!(items.into_iter().map(|(v, _)| v).collect::<Vec<_>>())))
+                "userId": r.other,
+                "username": r.username,
+                "displayName": r.display_name,
+                "avatarBlobId": r.avatar_blob_id,
+                "online": state.presence.is_online(r.other),
+                "lastSeen": r.last_seen.map(rfc3339),
+                "conversationId": r.cid,
+            })
+        })
+        .collect();
+    Ok(Json(json!(items)))
 }
 
 #[derive(Deserialize)]
@@ -221,19 +210,16 @@ pub async fn lookup_user(
     Query(q): Query<LookupQuery>,
 ) -> Result<Json<Value>, AppError> {
     let (_me, _device) = authed(&state, &headers).await?;
-    let a = state
-        .auth
-        .find_account_by_username(&q.username)
+    let u = db::find_user_by_username(&state.db.pool, &q.username)
         .await?
         .ok_or_else(|| AppError::NotFound("no user with that username".into()))?;
-    let prof = state.profiles.get(a.id);
     Ok(Json(json!({
-        "userId": a.id,
-        "username": a.username,
-        "displayName": prof.display_name,
-        "avatarBlobId": prof.avatar_blob_id,
-        "online": state.hub.is_online(a.id),
-        "lastSeen": state.hub.last_seen(a.id).map(rfc3339),
+        "userId": u.id,
+        "username": u.username,
+        "displayName": u.display_name,
+        "avatarBlobId": u.avatar_blob_id,
+        "online": state.presence.is_online(u.id),
+        "lastSeen": u.last_seen.map(rfc3339),
     })))
 }
 
@@ -254,17 +240,17 @@ pub async fn history(
         .find_account_by_username(&q.with)
         .await?
         .ok_or_else(|| AppError::NotFound("user not found".into()))?;
-    let convo = state.hub.conversation_id(me, target.id);
-    let peer_read = state.hub.read_seq(convo, target.id);
-    let peer_delivered = state.hub.delivered_seq(convo, target.id);
-    let msgs: Vec<Value> = state
-        .hub
-        .history(convo)
+    let convo = db::dm_conversation(&state.db.pool, me, target.id).await?;
+    let peer_read = db::read_seq(&state.db.pool, convo, target.id).await?;
+    let peer_delivered = db::delivered_seq(&state.db.pool, convo, target.id).await?;
+
+    let msgs: Vec<Value> = db::history(&state.db.pool, convo)
+        .await?
         .into_iter()
         .map(|m| {
             // Status is only meaningful for my own (outgoing) messages, derived
             // from how far the peer has read/received.
-            let status = if m.sender_account == me {
+            let status = if m.sender_account_id == me {
                 if peer_read >= m.seq {
                     "read"
                 } else if peer_delivered >= m.seq {
@@ -278,10 +264,10 @@ pub async fn history(
             json!({
                 "messageId": m.id,
                 "seq": m.seq,
-                "senderAccountId": m.sender_account,
-                "senderDeviceId": m.sender_device,
+                "senderAccountId": m.sender_account_id,
+                "senderDeviceId": m.sender_device_id,
                 "ciphertext": STANDARD.encode(&m.ciphertext),
-                "serverTs": rfc3339(m.ts),
+                "serverTs": rfc3339(m.server_ts),
                 "status": status,
             })
         })
