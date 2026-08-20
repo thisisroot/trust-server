@@ -83,6 +83,8 @@ pub struct MsgRow {
     pub sender_device_id: Option<Uuid>,
     pub ciphertext: Vec<u8>,
     pub server_ts: OffsetDateTime,
+    pub reply_to: Option<Uuid>,
+    pub edited_at: Option<OffsetDateTime>,
 }
 
 /// Append a message, assigning the next per-conversation seq atomically.
@@ -92,6 +94,7 @@ pub async fn store_message(
     sender_account: Uuid,
     sender_device: Uuid,
     ciphertext: &[u8],
+    reply_to: Option<Uuid>,
 ) -> Result<MsgRow, sqlx::Error> {
     // Row-locks the conversation → concurrent sends get distinct, gap-free seqs.
     let seq = sqlx::query_scalar::<_, i64>(
@@ -103,8 +106,8 @@ pub async fn store_message(
 
     let id = Uuid::new_v4();
     let server_ts = sqlx::query_scalar::<_, OffsetDateTime>(
-        "INSERT INTO messages (id, conversation_id, seq, sender_account_id, sender_device_id, ciphertext)
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING server_ts",
+        "INSERT INTO messages (id, conversation_id, seq, sender_account_id, sender_device_id, ciphertext, reply_to)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING server_ts",
     )
     .bind(id)
     .bind(cid)
@@ -112,6 +115,7 @@ pub async fn store_message(
     .bind(sender_account)
     .bind(sender_device)
     .bind(ciphertext)
+    .bind(reply_to)
     .fetch_one(pool)
     .await?;
 
@@ -122,13 +126,91 @@ pub async fn store_message(
         sender_device_id: Some(sender_device),
         ciphertext: ciphertext.to_vec(),
         server_ts,
+        reply_to,
+        edited_at: None,
     })
 }
 
-pub async fn history(pool: &PgPool, cid: Uuid) -> Result<Vec<MsgRow>, sqlx::Error> {
+pub async fn history(pool: &PgPool, cid: Uuid, me: Uuid) -> Result<Vec<MsgRow>, sqlx::Error> {
     sqlx::query_as::<_, MsgRow>(
-        "SELECT id, seq, sender_account_id, sender_device_id, ciphertext, server_ts
-         FROM messages WHERE conversation_id = $1 ORDER BY seq",
+        "SELECT id, seq, sender_account_id, sender_device_id, ciphertext, server_ts, reply_to, edited_at
+         FROM messages m
+         WHERE m.conversation_id = $1 AND m.deleted_at IS NULL
+           AND NOT EXISTS (SELECT 1 FROM hidden_messages h
+                           WHERE h.message_id = m.id AND h.account_id = $2)
+         ORDER BY m.seq",
+    )
+    .bind(cid)
+    .bind(me)
+    .fetch_all(pool)
+    .await
+}
+
+/// Hide a message from just `account`'s history (delete for me). Idempotent.
+pub async fn hide_message_for(pool: &PgPool, msg_id: Uuid, account: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO hidden_messages (message_id, account_id) VALUES ($1, $2)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(msg_id)
+    .bind(account)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Overwrite a message's ciphertext (edit), only if `sender` owns it and it's not
+/// deleted. Returns (conversation_id, seq, edited_at) when a row was changed.
+pub async fn edit_message(
+    pool: &PgPool,
+    msg_id: Uuid,
+    sender: Uuid,
+    ciphertext: &[u8],
+) -> Result<Option<(Uuid, i64, OffsetDateTime)>, sqlx::Error> {
+    Ok(sqlx::query_as::<_, (Uuid, i64, OffsetDateTime)>(
+        "UPDATE messages SET ciphertext = $3, edited_at = now()
+         WHERE id = $1 AND sender_account_id = $2 AND deleted_at IS NULL
+         RETURNING conversation_id, seq, edited_at",
+    )
+    .bind(msg_id)
+    .bind(sender)
+    .bind(ciphertext)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Soft-delete a message (delete for everyone). Any participant of the message's
+/// conversation may do this. Clears the ciphertext and drops any shared-media
+/// index rows. Returns (conversation_id, seq) when a row was changed.
+pub async fn delete_message(
+    pool: &PgPool,
+    msg_id: Uuid,
+    actor: Uuid,
+) -> Result<Option<(Uuid, i64)>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (Uuid, i64)>(
+        "UPDATE messages SET deleted_at = now(), ciphertext = ''
+         WHERE id = $1 AND deleted_at IS NULL
+           AND conversation_id IN
+               (SELECT conversation_id FROM conversation_members WHERE account_id = $2)
+         RETURNING conversation_id, seq",
+    )
+    .bind(msg_id)
+    .bind(actor)
+    .fetch_optional(pool)
+    .await?;
+    if row.is_some() {
+        sqlx::query("DELETE FROM media WHERE message_id = $1")
+            .bind(msg_id)
+            .execute(pool)
+            .await?;
+    }
+    Ok(row)
+}
+
+/// The account ids that are members of a conversation (both sides of a DM).
+pub async fn conversation_member_ids(pool: &PgPool, cid: Uuid) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT account_id FROM conversation_members WHERE conversation_id = $1",
     )
     .bind(cid)
     .fetch_all(pool)

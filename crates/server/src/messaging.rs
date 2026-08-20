@@ -103,6 +103,8 @@ pub struct SendReq {
     attachment: Option<crate::media::AttachmentMeta>,
     /// … or an album of them; each is indexed for the shared-media view.
     attachments: Option<Vec<crate::media::AttachmentMeta>>,
+    /// The message this one quotes (a reply), if any.
+    reply_to_message_id: Option<String>,
 }
 
 /// POST /v0/messages — send a message to a user; delivers over the bus.
@@ -123,7 +125,11 @@ pub async fn send_message(
         .map_err(|_| AppError::BadRequest("ciphertext must be base64".into()))?;
 
     let convo = db::dm_conversation(&state.db.pool, me, target.id).await?;
-    let msg = db::store_message(&state.db.pool, convo, me, my_device, &bytes).await?;
+    let reply_to = req
+        .reply_to_message_id
+        .as_deref()
+        .and_then(|v| Uuid::parse_str(v).ok());
+    let msg = db::store_message(&state.db.pool, convo, me, my_device, &bytes, reply_to).await?;
 
     // Index any attachments (single or album) for the shared-media view.
     let mut atts = req.attachments.unwrap_or_default();
@@ -161,6 +167,7 @@ pub async fn send_message(
             "senderDeviceId": my_device,
             "ciphertext": STANDARD.encode(&bytes),
             "serverTs": rfc3339(msg.server_ts),
+            "replyTo": reply_to,
         }),
     );
     if target.id == me {
@@ -250,7 +257,7 @@ pub async fn history(
     let peer_read = db::read_seq(&state.db.pool, convo, target.id).await?;
     let peer_delivered = db::delivered_seq(&state.db.pool, convo, target.id).await?;
 
-    let msgs: Vec<Value> = db::history(&state.db.pool, convo)
+    let msgs: Vec<Value> = db::history(&state.db.pool, convo, me)
         .await?
         .into_iter()
         .map(|m| {
@@ -275,6 +282,8 @@ pub async fn history(
                 "ciphertext": STANDARD.encode(&m.ciphertext),
                 "serverTs": rfc3339(m.server_ts),
                 "status": status,
+                "replyTo": m.reply_to,
+                "editedAt": m.edited_at.map(rfc3339),
             })
         })
         .collect();
@@ -283,4 +292,96 @@ pub async fn history(
         "withUserId": target.id,
         "messages": msgs,
     })))
+}
+
+/// Fan out an envelope to every member of a conversation (skipping the actor's
+/// own sending device).
+async fn deliver_to_conversation(
+    state: &AppState,
+    cid: Uuid,
+    env: &Envelope,
+    actor: Uuid,
+    actor_device: Uuid,
+) {
+    if let Ok(members) = db::conversation_member_ids(&state.db.pool, cid).await {
+        for m in members {
+            let except = if m == actor { Some(actor_device) } else { None };
+            deliver_to_account(state, m, env, except).await;
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditReq {
+    ciphertext: String,
+}
+
+/// PATCH /v0/messages/{id} — edit your own message (replaces its ciphertext).
+pub async fn edit_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<EditReq>,
+) -> Result<Json<Value>, AppError> {
+    let (me, my_device) = authed(&state, &headers).await?;
+    let msg_id = Uuid::parse_str(&id).map_err(|_| AppError::BadRequest("bad message id".into()))?;
+    let bytes = STANDARD
+        .decode(req.ciphertext.as_bytes())
+        .map_err(|_| AppError::BadRequest("ciphertext must be base64".into()))?;
+
+    let Some((cid, _seq, edited_at)) = db::edit_message(&state.db.pool, msg_id, me, &bytes).await?
+    else {
+        return Err(AppError::NotFound("no such message you can edit".into()));
+    };
+
+    let env = envelope(
+        "message.edited",
+        json!({
+            "conversationId": cid,
+            "messageId": msg_id,
+            "ciphertext": STANDARD.encode(&bytes),
+            "editedAt": rfc3339(edited_at),
+        }),
+    );
+    deliver_to_conversation(&state, cid, &env, me, my_device).await;
+
+    Ok(Json(json!({ "messageId": msg_id, "editedAt": rfc3339(edited_at) })))
+}
+
+#[derive(Deserialize)]
+pub struct DeleteQuery {
+    /// "me" hides it from just my history; anything else deletes for everyone.
+    scope: Option<String>,
+}
+
+/// DELETE /v0/messages/{id}?scope={me|everyone} — delete for me (hide) or, if I
+/// own it, for everyone.
+pub async fn delete_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(q): Query<DeleteQuery>,
+) -> Result<Json<Value>, AppError> {
+    let (me, my_device) = authed(&state, &headers).await?;
+    let msg_id = Uuid::parse_str(&id).map_err(|_| AppError::BadRequest("bad message id".into()))?;
+
+    // Delete for me: hide from my history only, no broadcast.
+    if q.scope.as_deref() == Some("me") {
+        db::hide_message_for(&state.db.pool, msg_id, me).await?;
+        return Ok(Json(json!({ "messageId": msg_id, "hidden": true })));
+    }
+
+    // Delete for everyone (only my own messages).
+    let Some((cid, _seq)) = db::delete_message(&state.db.pool, msg_id, me).await? else {
+        return Err(AppError::NotFound("no such message you can delete".into()));
+    };
+
+    let env = envelope(
+        "message.deleted",
+        json!({ "conversationId": cid, "messageId": msg_id }),
+    );
+    deliver_to_conversation(&state, cid, &env, me, my_device).await;
+
+    Ok(Json(json!({ "messageId": msg_id, "deleted": true })))
 }

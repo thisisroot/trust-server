@@ -7,7 +7,7 @@ use axum::{
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, patch, post},
     Json, Router,
 };
 use serde_json::json;
@@ -68,6 +68,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/messages",
             post(crate::messaging::send_message).get(crate::messaging::history),
+        )
+        .route(
+            "/messages/{id}",
+            patch(crate::messaging::edit_message).delete(crate::messaging::delete_message),
         )
         .route("/blobs", post(crate::blobs::upload_blob))
         .route("/conversations/{id}/media", get(crate::media::list_media))
